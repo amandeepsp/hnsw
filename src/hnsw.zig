@@ -71,6 +71,7 @@ pub const HnswIndex = struct {
     entry_point: usize,
     layers: usize = 0,
     nodes: std.ArrayListUnmanaged(Node),
+    visited: std.DynamicBitSetUnmanaged,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -92,6 +93,7 @@ pub const HnswIndex = struct {
             .store = store,
             .distance_fn = distance_fn,
             .nodes = try std.ArrayListUnmanaged(Node).initCapacity(alloc, params.num_words),
+            .visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, params.num_words),
         };
     }
 
@@ -106,14 +108,14 @@ pub const HnswIndex = struct {
         entry_point: usize,
         entry_factor: usize,
     ) ![]usize {
-        var visited = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.params.num_words);
-        defer visited.deinit(self.allocator);
+        self.visited.unsetAll();
+
         var candidates = std.PriorityQueue(SearchEntry, void, minCompareSearch).init(self.allocator, undefined);
         defer candidates.deinit();
         var farthest = std.PriorityQueue(SearchEntry, void, maxCompareSearch).init(self.allocator, undefined);
         defer farthest.deinit();
 
-        visited.set(entry_point);
+        self.visited.set(entry_point);
         try candidates.add(.{ .idx = entry_point, .dist = self.dist(idx, entry_point) });
         try farthest.add(.{ .idx = entry_point, .dist = self.dist(idx, entry_point) });
 
@@ -121,20 +123,21 @@ pub const HnswIndex = struct {
             const curr_candidate = candidates.remove();
             const curr_idx = curr_candidate.idx;
             const curr_distq = curr_candidate.dist;
-            const curr_farthest: ?SearchEntry = farthest.peek();
+            const curr_farthest = farthest.peek();
 
             if (curr_distq > curr_farthest.?.dist) {
                 break;
             }
 
             for (self.nodes.items[curr_idx].neighbors[layer].items) |nbr| {
-                if (!visited.isSet(nbr)) {
-                    visited.set(nbr);
+                if (!self.visited.isSet(nbr)) {
+                    self.visited.set(nbr);
 
+                    const nbr_dist = self.dist(nbr, idx);
                     const curr_farthest_ = farthest.peek();
-                    if (self.dist(nbr, idx) < curr_farthest_.?.dist) {
-                        try candidates.add(.{ .idx = nbr, .dist = self.dist(nbr, idx) });
-                        try farthest.add(.{ .idx = nbr, .dist = self.dist(nbr, idx) });
+                    if (farthest.count() < entry_factor or nbr_dist < curr_farthest_.?.dist) {
+                        try candidates.add(.{ .idx = nbr, .dist = nbr_dist });
+                        try farthest.add(.{ .idx = nbr, .dist = nbr_dist });
 
                         if (farthest.count() > entry_factor) {
                             _ = farthest.remove();
@@ -144,15 +147,16 @@ pub const HnswIndex = struct {
             }
         }
 
-        const results = try self.allocator.alloc(usize, farthest.count());
-        var i: usize = 0;
+        const count = farthest.count();
+        const results = try self.allocator.alloc(usize, count);
+        var i: usize = count;
         while (farthest.count() > 0) {
+            i -= 1;
             const entry = farthest.remove();
             results[i] = entry.idx;
-            i += 1;
         }
 
-        return results;
+        return results; //best to worst -- sincce farthest is a max heap
     }
 
     fn select_neighbors(

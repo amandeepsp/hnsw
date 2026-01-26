@@ -17,3 +17,7 @@ pub fn l2(a: []const f32, b: []const f32) f32 {
 
     return @sqrt(dist);
 }
+
+pub fn normCosine(a: []const f32, b: []const f32) f32 {
+    return 1.0 - dot(a, b);
+}
