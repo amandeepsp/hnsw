@@ -67,8 +67,7 @@ pub const HnswIndex = struct {
     store: *const VectorStore,
     distance_fn: distance.DistanceFn,
 
-    // TODO: we should use multiple entry points
-    entry_point: usize,
+    entry_points: std.ArrayListUnmanaged(usize),
     layers: usize = 0,
     nodes: std.ArrayListUnmanaged(Node),
     visited: std.DynamicBitSetUnmanaged,
@@ -88,7 +87,7 @@ pub const HnswIndex = struct {
                 @as(f64, @floatFromInt(params.max_nodes_per_layer)),
             ),
             .max_nodes_layer0 = 2 * params.max_nodes_per_layer,
-            .entry_point = 0,
+            .entry_points = .empty,
             .prng = std.Random.DefaultPrng.init(params.seed),
             .store = store,
             .distance_fn = distance_fn,
@@ -105,19 +104,21 @@ pub const HnswIndex = struct {
         self: *HnswIndex,
         layer: usize,
         idx: usize,
-        entry_point: usize,
+        entry_points: []usize,
         entry_factor: usize,
     ) ![]usize {
         self.visited.unsetAll();
 
-        var candidates = std.PriorityQueue(SearchEntry, void, minCompareSearch).init(self.allocator, undefined);
+        var candidates = std.PriorityQueue(SearchEntry, void, minCompareSearch).init(self.allocator, {});
         defer candidates.deinit();
-        var farthest = std.PriorityQueue(SearchEntry, void, maxCompareSearch).init(self.allocator, undefined);
+        var farthest = std.PriorityQueue(SearchEntry, void, maxCompareSearch).init(self.allocator, {});
         defer farthest.deinit();
 
-        self.visited.set(entry_point);
-        try candidates.add(.{ .idx = entry_point, .dist = self.dist(idx, entry_point) });
-        try farthest.add(.{ .idx = entry_point, .dist = self.dist(idx, entry_point) });
+        for (entry_points) |entry_point| {
+            self.visited.set(entry_point);
+            try candidates.add(.{ .idx = entry_point, .dist = self.dist(idx, entry_point) });
+            try farthest.add(.{ .idx = entry_point, .dist = self.dist(idx, entry_point) });
+        }
 
         while (candidates.count() > 0) {
             const curr_candidate = candidates.remove();
@@ -126,6 +127,7 @@ pub const HnswIndex = struct {
             const curr_farthest = farthest.peek();
 
             if (curr_distq > curr_farthest.?.dist) {
+                // All candidates are worse.
                 break;
             }
 
@@ -148,7 +150,7 @@ pub const HnswIndex = struct {
         }
 
         const count = farthest.count();
-        const results = try self.allocator.alloc(usize, count);
+        const results = try self.allocator.alloc(usize, count); //TODO: Save allocation?
         var i: usize = count;
         while (farthest.count() > 0) {
             i -= 1;
@@ -156,7 +158,7 @@ pub const HnswIndex = struct {
             results[i] = entry.idx;
         }
 
-        return results; //best to worst -- sincce farthest is a max heap
+        return results; //best to worst -- since farthest is a max heap
     }
 
     fn select_neighbors(
@@ -202,19 +204,22 @@ pub const HnswIndex = struct {
 
         // First node
         if (self.nodes.items.len == 1) {
-            self.entry_point = idx;
+            try self.entry_points.append(self.allocator, idx);
             self.layers = assigned_layer;
             return;
         }
 
-        var curr_entry_point = self.entry_point;
+        if (assigned_layer == self.layers) {
+            try self.entry_points.append(self.allocator, idx);
+        }
+
+        var curr_entry_points = self.entry_points.items;
         var current_layer = self.layers;
 
         var current_nearest: []usize = undefined;
 
         while (current_layer > assigned_layer) {
-            current_nearest = try self.search_layer(current_layer, idx, curr_entry_point, 1);
-            curr_entry_point = current_nearest[0];
+            curr_entry_points = try self.search_layer(current_layer, idx, curr_entry_points, 1);
             current_layer -= 1;
         }
 
@@ -225,7 +230,7 @@ pub const HnswIndex = struct {
             current_nearest = try self.search_layer(
                 current_layer,
                 idx,
-                curr_entry_point,
+                curr_entry_points,
                 self.params.ef_construction,
             );
 
@@ -239,16 +244,17 @@ pub const HnswIndex = struct {
 
                 const max_neighbors = if (current_layer == 0) self.max_nodes_layer0 else self.params.max_nodes_per_layer;
                 if (nbr_neighbors.items.len > max_neighbors) {
-                    self.prune_neighbors(nbr_neighbors, idx, max_neighbors);
+                    self.prune_neighbors(nbr_neighbors, nbr_idx, max_neighbors);
                 }
             }
 
-            curr_entry_point = current_nearest[0];
+            curr_entry_points = current_nearest;
         }
 
         if (assigned_layer > self.layers) {
             self.layers = assigned_layer;
-            self.entry_point = idx;
+            self.entry_points.clearRetainingCapacity(); // Old entry points don't exist at new top layer
+            try self.entry_points.append(self.allocator, idx);
         }
     }
 
@@ -273,16 +279,15 @@ pub const HnswIndex = struct {
 
     pub fn top_k(self: *HnswIndex, idx: usize, k: usize) ![]usize {
         var candidates: []usize = undefined;
-        var curr_entry_point = self.entry_point;
+        var curr_entry_points = self.entry_points.items;
         var curr_layer = self.layers;
 
         while (curr_layer > 0) {
-            candidates = try self.search_layer(curr_layer, idx, curr_entry_point, 1);
-            curr_entry_point = candidates[0];
+            curr_entry_points = try self.search_layer(curr_layer, idx, curr_entry_points, 1);
             curr_layer -= 1;
         }
 
-        candidates = try self.search_layer(0, idx, curr_entry_point, self.params.ef_search);
+        candidates = try self.search_layer(0, idx, curr_entry_points, self.params.ef_search);
 
         return candidates[0..@min(k, candidates.len)];
     }

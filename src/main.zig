@@ -44,7 +44,7 @@ pub fn main() !void {
 
     var insert_count: usize = 0;
     var last_report: u64 = 0;
-    for (0..GLOVE_NUM_WORDS) |idx| {
+    for (0..store.count) |idx| {
         try hnsw_index.insert(idx);
         insert_count += 1;
 
@@ -60,6 +60,10 @@ pub fn main() !void {
     std.log.info(
         "hnsw_index built - size: {d}, took: {d:.2}s",
         .{ hnsw_index.nodes.items.len, @as(f64, @floatFromInt(elapsed)) / 1e9 },
+    );
+    std.log.info(
+        "entry_points: {d}, top_layer: {d}",
+        .{ hnsw_index.entry_points.items.len, hnsw_index.layers },
     );
 
     try benchmark.runBenchmark(allocator, &store, &hnsw_index, &distance.normCosine, 100, 10);
