@@ -1,0 +1,11 @@
+.{
+    .name = .hnsw,
+    .version = "0.0.0",
+    .fingerprint = 0x57ec2870290ea0f7, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.15.2",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
