@@ -3,8 +3,10 @@ const distance = @import("distance.zig");
 const index = @import("index.zig");
 const VectorStore = index.VectorStore;
 
+pub const NodeIdx = u32;
+
 const Node = struct {
-    neighbors: []std.ArrayListUnmanaged(usize),
+    neighbors: []std.ArrayListUnmanaged(NodeIdx),
 
     pub fn initEmpty(
         alloc: std.mem.Allocator,
@@ -12,7 +14,7 @@ const Node = struct {
         layer_size: usize,
         layer_size0: usize,
     ) !Node {
-        const neighbors = try alloc.alloc(std.ArrayListUnmanaged(usize), layer + 1);
+        const neighbors = try alloc.alloc(std.ArrayListUnmanaged(NodeIdx), layer + 1);
         for (neighbors, 0..layer + 1) |*nbrs, l| {
             nbrs.* = .empty;
             const node_cap = if (l == 0) layer_size0 else layer_size;
@@ -24,7 +26,7 @@ const Node = struct {
 };
 
 const SearchEntry = struct {
-    idx: usize,
+    idx: NodeIdx,
     dist: f32,
 };
 
@@ -32,14 +34,12 @@ fn minCompare(_: void, a: SearchEntry, b: SearchEntry) bool {
     return a.dist < b.dist;
 }
 
-// Min-heap for candidates (explore closest first)
 fn minCompareSearch(_: void, a: SearchEntry, b: SearchEntry) std.math.Order {
     return std.math.order(a.dist, b.dist);
 }
 
-// Max-heap for results (track farthest)
 fn maxCompareSearch(_: void, a: SearchEntry, b: SearchEntry) std.math.Order {
-    return std.math.order(b.dist, a.dist); // reversed
+    return std.math.order(b.dist, a.dist);
 }
 
 pub const HnswIndex = struct {
@@ -59,7 +59,7 @@ pub const HnswIndex = struct {
     store: *const VectorStore,
     distance_fn: distance.DistanceFn,
 
-    entry_points: std.ArrayListUnmanaged(usize),
+    entry_points: std.ArrayListUnmanaged(NodeIdx),
     layers: usize = 0,
     nodes: std.ArrayListUnmanaged(Node),
     visited: std.DynamicBitSetUnmanaged,
@@ -88,17 +88,17 @@ pub const HnswIndex = struct {
         };
     }
 
-    fn dist(self: *HnswIndex, a: usize, b: usize) f32 {
-        return self.distance_fn(self.store.vec(a), self.store.vec(b));
+    fn dist(self: *HnswIndex, a: NodeIdx, b: NodeIdx) f32 {
+        return self.distance_fn(self.store.vec(@intCast(a)), self.store.vec(@intCast(b)));
     }
 
     fn searchLayer(
         self: *HnswIndex,
         layer: usize,
-        idx: usize,
-        entry_points: std.ArrayListUnmanaged(usize),
+        idx: NodeIdx,
+        entry_points: std.ArrayListUnmanaged(NodeIdx),
         entry_factor: usize,
-    ) !std.ArrayListUnmanaged(usize) {
+    ) !std.ArrayListUnmanaged(NodeIdx) {
         self.visited.unsetAll();
 
         var candidates = std.PriorityQueue(SearchEntry, void, minCompareSearch).init(self.allocator, {});
@@ -119,7 +119,6 @@ pub const HnswIndex = struct {
             const curr_farthest = farthest.peek();
 
             if (curr_distq > curr_farthest.?.dist) {
-                // All candidates are worse.
                 break;
             }
 
@@ -142,7 +141,7 @@ pub const HnswIndex = struct {
         }
 
         const count = farthest.count();
-        var results: std.ArrayListUnmanaged(usize) = .empty;
+        var results: std.ArrayListUnmanaged(NodeIdx) = .empty;
         try results.resize(self.allocator, count);
         var i: usize = count;
         while (farthest.count() > 0) {
@@ -151,18 +150,18 @@ pub const HnswIndex = struct {
             results.items[i] = entry.idx;
         }
 
-        return results; //best to worst -- since farthest is a max heap
+        return results;
     }
 
     fn selectNeighbors(
         self: *HnswIndex,
         layer: usize,
-        idx: usize,
-        candidates: *std.ArrayListUnmanaged(usize),
+        idx: NodeIdx,
+        candidates: *std.ArrayListUnmanaged(NodeIdx),
     ) !void {
         const max_nodes = if (layer == 0) self.max_nodes_layer0 else self.params.max_nodes_per_layer;
 
-        var visited: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        var visited: std.AutoHashMapUnmanaged(NodeIdx, void) = .empty;
         defer visited.deinit(self.allocator);
         var candidate_entries: std.ArrayListUnmanaged(SearchEntry) = .empty;
         defer candidate_entries.deinit(self.allocator);
@@ -180,7 +179,7 @@ pub const HnswIndex = struct {
             var good = true;
             for (candidates.items) |s| {
                 if (self.dist(c.idx, s) < c.dist) {
-                    good = false; // a candidate should not be closer to another, than to idx
+                    good = false;
                     break;
                 }
             }
@@ -193,10 +192,7 @@ pub const HnswIndex = struct {
         }
     }
 
-    pub fn insert(
-        self: *HnswIndex,
-        idx: usize,
-    ) !void {
+    pub fn insert(self: *HnswIndex, idx: NodeIdx) !void {
         const random = self.prng.random();
 
         const urandom = random.float(f64);
@@ -213,7 +209,6 @@ pub const HnswIndex = struct {
 
         try self.nodes.append(self.allocator, node);
 
-        // First node
         if (self.nodes.items.len == 1) {
             try self.entry_points.append(self.allocator, idx);
             self.layers = assigned_layer;
@@ -224,10 +219,10 @@ pub const HnswIndex = struct {
             try self.entry_points.append(self.allocator, idx);
         }
 
-        var curr_entry_points: std.ArrayListUnmanaged(usize) = self.entry_points;
+        var curr_entry_points: std.ArrayListUnmanaged(NodeIdx) = self.entry_points;
         var current_layer = self.layers;
 
-        var current_nearest: std.ArrayListUnmanaged(usize) = undefined;
+        var current_nearest: std.ArrayListUnmanaged(NodeIdx) = undefined;
 
         while (current_layer > assigned_layer) {
             const new_entry_points = try self.searchLayer(current_layer, idx, curr_entry_points, 1);
@@ -265,13 +260,13 @@ pub const HnswIndex = struct {
 
         if (assigned_layer > self.layers) {
             self.layers = assigned_layer;
-            self.entry_points.clearRetainingCapacity(); // Old entry points don't exist at new top layer
+            self.entry_points.clearRetainingCapacity();
             try self.entry_points.append(self.allocator, idx);
         }
     }
 
-    pub fn topK(self: *HnswIndex, idx: usize, k: usize) !std.ArrayListUnmanaged(usize) {
-        var candidates: std.ArrayListUnmanaged(usize) = undefined;
+    pub fn topK(self: *HnswIndex, idx: NodeIdx, k: usize) !std.ArrayListUnmanaged(NodeIdx) {
+        var candidates: std.ArrayListUnmanaged(NodeIdx) = undefined;
         var curr_entry_points = self.entry_points;
         var curr_layer = self.layers;
 

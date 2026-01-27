@@ -45,7 +45,7 @@ pub fn main() !void {
     var insert_count: usize = 0;
     var last_report: u64 = 0;
     for (0..store.count) |idx| {
-        try hnsw_index.insert(idx);
+        try hnsw_index.insert(@intCast(idx));
         insert_count += 1;
 
         if (insert_count % 10000 == 0) {

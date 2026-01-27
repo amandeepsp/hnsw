@@ -42,11 +42,11 @@ pub fn bruteForceTopK(
     return top_k;
 }
 
-pub fn computeRecall(hnsw_results: std.ArrayListUnmanaged(usize), bf_results: []const usize) f32 {
+pub fn computeRecall(hnsw_results: std.ArrayListUnmanaged(hnsw.NodeIdx), bf_results: []const usize) f32 {
     var hits: usize = 0;
     for (hnsw_results.items) |h| {
         for (bf_results) |b| {
-            if (h == b) {
+            if (h == @as(hnsw.NodeIdx, @intCast(b))) {
                 hits += 1;
                 break;
             }
@@ -73,7 +73,7 @@ pub fn runBenchmark(
         const query_idx = q * step;
 
         var timer = try std.time.Timer.start();
-        const hnsw_results = try hnsw_index.topK(query_idx, k);
+        const hnsw_results = try hnsw_index.topK(@intCast(query_idx), k);
         hnsw_time += timer.read();
 
         timer.reset();
