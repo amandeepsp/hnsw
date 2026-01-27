@@ -61,10 +61,6 @@ pub fn main() !void {
         "hnsw_index built - size: {d}, took: {d:.2}s",
         .{ hnsw_index.nodes.items.len, @as(f64, @floatFromInt(elapsed)) / 1e9 },
     );
-    std.log.info(
-        "entry_points: {d}, top_layer: {d}",
-        .{ hnsw_index.entry_points.items.len, hnsw_index.layers },
-    );
 
     try benchmark.runBenchmark(allocator, &store, &hnsw_index, &distance.normCosine, 100, 10);
 }

@@ -23,29 +23,21 @@ const Node = struct {
     }
 };
 
-const SortCtx = struct {
-    store: *const VectorStore,
-    query_idx: usize,
-    dist_fn: distance.DistanceFn,
-};
-
-fn compareByDistance(ctx: SortCtx, a: usize, b: usize) bool {
-    const dist_a = ctx.dist_fn(ctx.store.vec(ctx.query_idx), ctx.store.vec(a));
-    const dist_b = ctx.dist_fn(ctx.store.vec(ctx.query_idx), ctx.store.vec(b));
-    return dist_a < dist_b;
-}
-
 const SearchEntry = struct {
     idx: usize,
     dist: f32,
 };
+
+fn minCompare(_: void, a: SearchEntry, b: SearchEntry) bool {
+    return a.dist < b.dist;
+}
 
 // Min-heap for candidates (explore closest first)
 fn minCompareSearch(_: void, a: SearchEntry, b: SearchEntry) std.math.Order {
     return std.math.order(a.dist, b.dist);
 }
 
-// Max-heap for results (track furthest)
+// Max-heap for results (track farthest)
 fn maxCompareSearch(_: void, a: SearchEntry, b: SearchEntry) std.math.Order {
     return std.math.order(b.dist, a.dist); // reversed
 }
@@ -100,13 +92,13 @@ pub const HnswIndex = struct {
         return self.distance_fn(self.store.vec(a), self.store.vec(b));
     }
 
-    fn search_layer(
+    fn searchLayer(
         self: *HnswIndex,
         layer: usize,
         idx: usize,
-        entry_points: []usize,
+        entry_points: std.ArrayListUnmanaged(usize),
         entry_factor: usize,
-    ) ![]usize {
+    ) !std.ArrayListUnmanaged(usize) {
         self.visited.unsetAll();
 
         var candidates = std.PriorityQueue(SearchEntry, void, minCompareSearch).init(self.allocator, {});
@@ -114,7 +106,7 @@ pub const HnswIndex = struct {
         var farthest = std.PriorityQueue(SearchEntry, void, maxCompareSearch).init(self.allocator, {});
         defer farthest.deinit();
 
-        for (entry_points) |entry_point| {
+        for (entry_points.items) |entry_point| {
             self.visited.set(entry_point);
             try candidates.add(.{ .idx = entry_point, .dist = self.dist(idx, entry_point) });
             try farthest.add(.{ .idx = entry_point, .dist = self.dist(idx, entry_point) });
@@ -150,36 +142,55 @@ pub const HnswIndex = struct {
         }
 
         const count = farthest.count();
-        const results = try self.allocator.alloc(usize, count); //TODO: Save allocation?
+        var results: std.ArrayListUnmanaged(usize) = .empty;
+        try results.resize(self.allocator, count);
         var i: usize = count;
         while (farthest.count() > 0) {
             i -= 1;
             const entry = farthest.remove();
-            results[i] = entry.idx;
+            results.items[i] = entry.idx;
         }
 
         return results; //best to worst -- since farthest is a max heap
     }
 
-    fn select_neighbors(
+    fn selectNeighbors(
         self: *HnswIndex,
         layer: usize,
         idx: usize,
-        candidates: []usize,
-    ) ![]usize {
+        candidates: *std.ArrayListUnmanaged(usize),
+    ) !void {
         const max_nodes = if (layer == 0) self.max_nodes_layer0 else self.params.max_nodes_per_layer;
 
-        std.mem.sort(
-            usize,
-            candidates,
-            SortCtx{
-                .store = self.store,
-                .query_idx = idx,
-                .dist_fn = self.distance_fn,
-            },
-            compareByDistance,
-        );
-        return candidates[0..@min(candidates.len, max_nodes)];
+        var visited: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        defer visited.deinit(self.allocator);
+        var candidate_entries: std.ArrayListUnmanaged(SearchEntry) = .empty;
+        defer candidate_entries.deinit(self.allocator);
+
+        for (candidates.items) |c| {
+            try candidate_entries.append(self.allocator, .{ .idx = c, .dist = self.dist(c, idx) });
+            try visited.put(self.allocator, c, {});
+        }
+
+        candidates.clearRetainingCapacity();
+
+        std.mem.sort(SearchEntry, candidate_entries.items, {}, minCompare);
+
+        for (candidate_entries.items) |c| {
+            var good = true;
+            for (candidates.items) |s| {
+                if (self.dist(c.idx, s) < c.dist) {
+                    good = false; // a candidate should not be closer to another, than to idx
+                    break;
+                }
+            }
+            if (good) {
+                try candidates.append(self.allocator, c.idx);
+            }
+            if (candidates.items.len >= max_nodes) {
+                break;
+            }
+        }
     }
 
     pub fn insert(
@@ -213,13 +224,14 @@ pub const HnswIndex = struct {
             try self.entry_points.append(self.allocator, idx);
         }
 
-        var curr_entry_points = self.entry_points.items;
+        var curr_entry_points: std.ArrayListUnmanaged(usize) = self.entry_points;
         var current_layer = self.layers;
 
-        var current_nearest: []usize = undefined;
+        var current_nearest: std.ArrayListUnmanaged(usize) = undefined;
 
         while (current_layer > assigned_layer) {
-            curr_entry_points = try self.search_layer(current_layer, idx, curr_entry_points, 1);
+            const new_entry_points = try self.searchLayer(current_layer, idx, curr_entry_points, 1);
+            curr_entry_points = new_entry_points;
             current_layer -= 1;
         }
 
@@ -227,16 +239,16 @@ pub const HnswIndex = struct {
         while (current_layer > 0) {
             current_layer -= 1;
 
-            current_nearest = try self.search_layer(
+            current_nearest = try self.searchLayer(
                 current_layer,
                 idx,
                 curr_entry_points,
                 self.params.ef_construction,
             );
 
-            const neighbors = try self.select_neighbors(current_layer, idx, current_nearest);
+            try self.selectNeighbors(current_layer, idx, &current_nearest);
 
-            for (neighbors) |nbr_idx| {
+            for (current_nearest.items) |nbr_idx| {
                 try self.nodes.items[idx].neighbors[current_layer].append(self.allocator, nbr_idx);
 
                 const nbr_neighbors = &self.nodes.items[nbr_idx].neighbors[current_layer];
@@ -244,7 +256,7 @@ pub const HnswIndex = struct {
 
                 const max_neighbors = if (current_layer == 0) self.max_nodes_layer0 else self.params.max_nodes_per_layer;
                 if (nbr_neighbors.items.len > max_neighbors) {
-                    self.prune_neighbors(nbr_neighbors, nbr_idx, max_neighbors);
+                    try self.selectNeighbors(current_layer, nbr_idx, nbr_neighbors);
                 }
             }
 
@@ -258,37 +270,19 @@ pub const HnswIndex = struct {
         }
     }
 
-    fn prune_neighbors(
-        self: *HnswIndex,
-        neighbors: *std.ArrayListUnmanaged(usize),
-        idx: usize,
-        max_size: usize,
-    ) void {
-        std.mem.sort(
-            usize,
-            neighbors.items,
-            SortCtx{
-                .store = self.store,
-                .query_idx = idx,
-                .dist_fn = self.distance_fn,
-            },
-            compareByDistance,
-        );
-        neighbors.shrinkRetainingCapacity(max_size);
-    }
-
-    pub fn top_k(self: *HnswIndex, idx: usize, k: usize) ![]usize {
-        var candidates: []usize = undefined;
-        var curr_entry_points = self.entry_points.items;
+    pub fn topK(self: *HnswIndex, idx: usize, k: usize) !std.ArrayListUnmanaged(usize) {
+        var candidates: std.ArrayListUnmanaged(usize) = undefined;
+        var curr_entry_points = self.entry_points;
         var curr_layer = self.layers;
 
         while (curr_layer > 0) {
-            curr_entry_points = try self.search_layer(curr_layer, idx, curr_entry_points, 1);
+            const new_entry_points = try self.searchLayer(curr_layer, idx, curr_entry_points, 1);
+            curr_entry_points = new_entry_points;
             curr_layer -= 1;
         }
 
-        candidates = try self.search_layer(0, idx, curr_entry_points, self.params.ef_search);
-
-        return candidates[0..@min(k, candidates.len)];
+        candidates = try self.searchLayer(0, idx, curr_entry_points, self.params.ef_search);
+        candidates.shrinkRetainingCapacity(k);
+        return candidates;
     }
 };
