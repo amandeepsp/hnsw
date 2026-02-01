@@ -8,10 +8,7 @@ const GLOVE_NUM_WORDS = 1291147;
 const GLOVE_DIM = 50;
 
 pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-
-    const allocator = arena.allocator();
+    const allocator = std.heap.c_allocator;
     var timer = try std.time.Timer.start();
 
     // Read vectors from stdin, text, vecs...

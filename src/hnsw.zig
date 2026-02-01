@@ -161,14 +161,11 @@ pub const HnswIndex = struct {
     ) !void {
         const max_nodes = if (layer == 0) self.max_nodes_layer0 else self.params.max_nodes_per_layer;
 
-        var visited: std.AutoHashMapUnmanaged(NodeIdx, void) = .empty;
-        defer visited.deinit(self.allocator);
         var candidate_entries: std.ArrayListUnmanaged(SearchEntry) = .empty;
         defer candidate_entries.deinit(self.allocator);
 
         for (candidates.items) |c| {
             try candidate_entries.append(self.allocator, .{ .idx = c, .dist = self.dist(c, idx) });
-            try visited.put(self.allocator, c, {});
         }
 
         candidates.clearRetainingCapacity();
