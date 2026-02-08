@@ -12,13 +12,11 @@ const Node = struct {
         alloc: std.mem.Allocator,
         layer: usize,
         layer_size: usize,
-        layer_size0: usize,
     ) !Node {
-        const neighbors = try alloc.alloc(std.ArrayListUnmanaged(NodeIdx), layer + 1);
-        for (neighbors, 0..layer + 1) |*nbrs, l| {
+        const neighbors = try alloc.alloc(std.ArrayListUnmanaged(NodeIdx), layer);
+        for (neighbors) |*nbrs| {
             nbrs.* = .empty;
-            const node_cap = if (l == 0) layer_size0 else layer_size;
-            try nbrs.ensureTotalCapacityPrecise(alloc, node_cap);
+            try nbrs.ensureTotalCapacityPrecise(alloc, layer_size);
         }
 
         return .{ .neighbors = neighbors };
@@ -44,7 +42,7 @@ fn maxCompareSearch(_: void, a: SearchEntry, b: SearchEntry) std.math.Order {
 
 pub const HnswIndex = struct {
     pub const Params = struct {
-        max_nodes_per_layer: usize,
+        max_neighbors_per_layer: usize,
         ef_construction: usize,
         ef_search: usize,
         num_words: usize,
@@ -53,7 +51,8 @@ pub const HnswIndex = struct {
 
     params: Params,
     layer_mult: f64,
-    max_nodes_layer0: usize,
+    max_neighbors_layer0: usize,
+    layer0_stride: usize,
     prng: std.Random.DefaultPrng,
     allocator: std.mem.Allocator,
     store: *const VectorStore,
@@ -64,28 +63,80 @@ pub const HnswIndex = struct {
     nodes: std.ArrayListUnmanaged(Node),
     visited: std.DynamicBitSetUnmanaged,
 
+    // Layer 0 has all the nodes, so we can optimize searches by keeping layer0 flat
+    // to improve cache locality.
+    // length = max_neighbors_layer0 * num_words, this will be allocated once and reused.
+    layer0_neighbors: []NodeIdx,
+    // Number of neighbors for each node in layer 0, keeps track of the end offset in layer0_neighbors.
+    // length = num_words, preallocated once and reused.
+    layer0_neighbor_counts: []usize,
+
     pub fn init(
         alloc: std.mem.Allocator,
         store: *const VectorStore,
         distance_fn: distance.DistanceFn,
         params: Params,
     ) !HnswIndex {
+        const neighbor_counts = try alloc.alloc(usize, params.num_words);
+        @memset(neighbor_counts, 0);
+        const max_neighbors_layer0 = 2 * params.max_neighbors_per_layer;
+        const layer0_stride = max_neighbors_layer0 + 1;
+
         return .{
             .allocator = alloc,
             .params = params,
             .layer_mult = 1.0 / std.math.log(
                 f64,
                 std.math.e,
-                @as(f64, @floatFromInt(params.max_nodes_per_layer)),
+                @as(f64, @floatFromInt(params.max_neighbors_per_layer)),
             ),
-            .max_nodes_layer0 = 2 * params.max_nodes_per_layer,
+            .max_neighbors_layer0 = max_neighbors_layer0,
+            .layer0_stride = layer0_stride,
             .entry_points = .empty,
             .prng = std.Random.DefaultPrng.init(params.seed),
             .store = store,
             .distance_fn = distance_fn,
             .nodes = try std.ArrayListUnmanaged(Node).initCapacity(alloc, params.num_words),
             .visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, params.num_words),
+            .layer0_neighbors = try alloc.alloc(NodeIdx, params.num_words * layer0_stride),
+            .layer0_neighbor_counts = neighbor_counts,
         };
+    }
+
+    fn neighborsCapAtLayer(self: *HnswIndex, layer: usize) usize {
+        if (layer == 0) {
+            return self.max_neighbors_layer0;
+        }
+
+        return self.params.max_neighbors_per_layer;
+    }
+
+    fn neighborsAtLayer(self: *HnswIndex, idx: NodeIdx, layer: usize) []NodeIdx {
+        if (layer == 0) {
+            const neighbor_count = self.layer0_neighbor_counts[idx];
+            const neighbors_start = idx * self.layer0_stride;
+            return self.layer0_neighbors[neighbors_start .. neighbors_start + neighbor_count];
+        }
+
+        return self.nodes.items[idx].neighbors[layer - 1].items;
+    }
+
+    fn appendNeighbor(self: *HnswIndex, idx: NodeIdx, nbr_idx: NodeIdx, layer: usize) !void {
+        if (layer == 0) {
+            const neighbor_count_idx = self.layer0_neighbor_counts[idx];
+            const neighbor_count_nbr = self.layer0_neighbor_counts[nbr_idx];
+
+            self.layer0_neighbors[idx * self.layer0_stride + neighbor_count_idx] = nbr_idx;
+            self.layer0_neighbors[nbr_idx * self.layer0_stride + neighbor_count_nbr] = idx;
+
+            self.layer0_neighbor_counts[idx] += 1;
+            self.layer0_neighbor_counts[nbr_idx] += 1;
+        } else {
+            try self.nodes.items[idx].neighbors[layer - 1].append(self.allocator, nbr_idx);
+
+            const nbr_neighbors = &self.nodes.items[nbr_idx].neighbors[layer - 1];
+            try nbr_neighbors.append(self.allocator, idx);
+        }
     }
 
     fn dist(self: *HnswIndex, a: NodeIdx, b: NodeIdx) f32 {
@@ -122,7 +173,7 @@ pub const HnswIndex = struct {
                 break;
             }
 
-            for (self.nodes.items[curr_idx].neighbors[layer].items) |nbr| {
+            for (self.neighborsAtLayer(curr_idx, layer)) |nbr| {
                 if (!self.visited.isSet(nbr)) {
                     self.visited.set(nbr);
 
@@ -159,7 +210,7 @@ pub const HnswIndex = struct {
         idx: NodeIdx,
         candidates: *std.ArrayListUnmanaged(NodeIdx),
     ) !void {
-        const max_nodes = if (layer == 0) self.max_nodes_layer0 else self.params.max_nodes_per_layer;
+        const max_nodes = self.neighborsCapAtLayer(layer);
 
         var candidate_entries: std.ArrayListUnmanaged(SearchEntry) = .empty;
         defer candidate_entries.deinit(self.allocator);
@@ -189,6 +240,17 @@ pub const HnswIndex = struct {
         }
     }
 
+    fn pruneNeighbors0(self: *HnswIndex, idx: NodeIdx) !void {
+        const start = idx * self.layer0_stride;
+        const count = self.layer0_neighbor_counts[idx];
+        var nbr_list = std.ArrayListUnmanaged(NodeIdx){
+            .items = self.layer0_neighbors[start .. start + count],
+            .capacity = self.layer0_stride,
+        };
+        try self.selectNeighbors(0, idx, &nbr_list);
+        self.layer0_neighbor_counts[idx] = nbr_list.items.len;
+    }
+
     pub fn insert(self: *HnswIndex, idx: NodeIdx) !void {
         const random = self.prng.random();
 
@@ -200,8 +262,7 @@ pub const HnswIndex = struct {
         const node = try Node.initEmpty(
             self.allocator,
             assigned_layer,
-            self.params.max_nodes_per_layer,
-            self.max_nodes_layer0,
+            self.params.max_neighbors_per_layer,
         );
 
         try self.nodes.append(self.allocator, node);
@@ -241,14 +302,19 @@ pub const HnswIndex = struct {
             try self.selectNeighbors(current_layer, idx, &current_nearest);
 
             for (current_nearest.items) |nbr_idx| {
-                try self.nodes.items[idx].neighbors[current_layer].append(self.allocator, nbr_idx);
+                const max_neighbors = self.neighborsCapAtLayer(current_layer);
+                try self.appendNeighbor(idx, nbr_idx, current_layer);
 
-                const nbr_neighbors = &self.nodes.items[nbr_idx].neighbors[current_layer];
-                try nbr_neighbors.append(self.allocator, idx);
-
-                const max_neighbors = if (current_layer == 0) self.max_nodes_layer0 else self.params.max_nodes_per_layer;
-                if (nbr_neighbors.items.len > max_neighbors) {
-                    try self.selectNeighbors(current_layer, nbr_idx, nbr_neighbors);
+                if (current_layer == 0) {
+                    const count = self.layer0_neighbor_counts[nbr_idx];
+                    if (count > max_neighbors) {
+                        try self.pruneNeighbors0(nbr_idx);
+                    }
+                } else {
+                    const nbr_neighbors = &self.nodes.items[nbr_idx].neighbors[current_layer - 1];
+                    if (nbr_neighbors.items.len > max_neighbors) {
+                        try self.selectNeighbors(current_layer, nbr_idx, nbr_neighbors);
+                    }
                 }
             }
 

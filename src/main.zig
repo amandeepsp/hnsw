@@ -33,7 +33,7 @@ pub fn main() !void {
     // const word_index = try index.buildWordIndex(allocator, &store);
 
     var hnsw_index = try hnsw.HnswIndex.init(allocator, &store, &distance.normCosine, .{
-        .max_nodes_per_layer = 16,
+        .max_neighbors_per_layer = 16,
         .ef_construction = 50,
         .ef_search = 50,
         .num_words = store.count,
